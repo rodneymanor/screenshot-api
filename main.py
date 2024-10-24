@@ -1,15 +1,16 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 import subprocess
 import os
 from datetime import timedelta
 import shutil
 import uuid
-from typing import Optional
-from pydantic import BaseModel
+from typing import Optional, List
 import logging
 import uvicorn
+from pathlib import Path
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -17,7 +18,6 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Video Screenshot API")
 
-# Configure CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -30,31 +30,32 @@ app.add_middleware(
 TEMP_DIR = "temp"
 os.makedirs(TEMP_DIR, exist_ok=True)
 
-class ScreenshotRequest(BaseModel):
-    num_screenshots: Optional[int] = 10
-    quality: Optional[int] = 2  # 2-31, lower is better
+# Mount the temp directory for static file access
+app.mount("/temp", StaticFiles(directory=TEMP_DIR), name="temp")
+
+def get_video_duration(video_path: str) -> float:
+    """Get video duration using FFprobe."""
+    duration_cmd = [
+        'ffprobe',
+        '-v', 'error',
+        '-show_entries', 'format=duration',
+        '-of', 'default=noprint_wrappers=1:nokey=1',
+        video_path
+    ]
+    return float(subprocess.check_output(duration_cmd).decode('utf-8').strip())
 
 def process_video(
     video_path: str,
     output_dir: str,
     num_screenshots: int = 10,
     quality: int = 2
-) -> None:
-    """Process video and generate screenshots."""
+) -> List[str]:
+    """Process video and return list of screenshot paths."""
+    screenshot_paths = []
     try:
-        # Get video duration using FFprobe
-        duration_cmd = [
-            'ffprobe',
-            '-v', 'error',
-            '-show_entries', 'format=duration',
-            '-of', 'default=noprint_wrappers=1:nokey=1',
-            video_path
-        ]
-        
-        duration = float(subprocess.check_output(duration_cmd).decode('utf-8').strip())
+        duration = get_video_duration(video_path)
         interval = duration / (num_screenshots + 1)
         
-        # Extract screenshots
         for i in range(num_screenshots):
             time_point = interval * (i + 1)
             timestamp = str(timedelta(seconds=int(time_point)))
@@ -70,7 +71,10 @@ def process_video(
             ]
             
             subprocess.run(ffmpeg_cmd, stderr=subprocess.PIPE)
+            screenshot_paths.append(output_file)
             logger.info(f'Generated screenshot {i+1}/{num_screenshots}')
+        
+        return screenshot_paths
     
     except Exception as e:
         logger.error(f"Error processing video: {str(e)}")
@@ -83,16 +87,16 @@ async def create_screenshots(
     quality: Optional[int] = 2
 ):
     """
-    Upload a video and receive screenshots as a ZIP file.
+    Upload a video and receive URLs for all screenshots.
+    Screenshots are saved in a job-specific directory.
     """
     if not video.filename.lower().endswith(('.mp4', '.avi', '.mov', '.mkv')):
         raise HTTPException(400, "Unsupported file format")
     
-    # Create temporary directories
+    # Create job directory with UUID
     job_id = str(uuid.uuid4())
     job_dir = os.path.join(TEMP_DIR, job_id)
-    screenshots_dir = os.path.join(job_dir, "screenshots")
-    os.makedirs(screenshots_dir, exist_ok=True)
+    os.makedirs(job_dir)
     
     try:
         # Save uploaded video
@@ -100,34 +104,43 @@ async def create_screenshots(
         with open(video_path, "wb") as buffer:
             shutil.copyfileobj(video.file, buffer)
         
-        # Process video
-        process_video(video_path, screenshots_dir, num_screenshots, quality)
+        # Process video and get screenshot paths
+        screenshot_paths = process_video(video_path, job_dir, num_screenshots, quality)
         
-        # Create ZIP file
-        zip_path = os.path.join(job_dir, "screenshots.zip")
-        with shutil.ZipFile(zip_path, 'w') as zipf:
-            for file in os.listdir(screenshots_dir):
-                file_path = os.path.join(screenshots_dir, file)
-                zipf.write(file_path, file)
+        # Remove the video file to save space
+        os.remove(video_path)
         
-        # Return ZIP file
-        return FileResponse(
-            zip_path,
-            media_type='application/zip',
-            filename=f'screenshots_{job_id}.zip',
-            background=shutil.rmtree(job_dir, ignore_errors=True)  # Cleanup after sending
-        )
+        # Generate URLs for each screenshot
+        base_url = f"/temp/{job_id}"
+        screenshots = []
+        for i, path in enumerate(screenshot_paths, 1):
+            filename = os.path.basename(path)
+            screenshots.append({
+                "id": i,
+                "filename": filename,
+                "url": f"{base_url}/{filename}"
+            })
+        
+        return JSONResponse({
+            "job_id": job_id,
+            "screenshot_dir": f"/temp/{job_id}",
+            "screenshots": screenshots
+        })
         
     except Exception as e:
         # Cleanup on error
         shutil.rmtree(job_dir, ignore_errors=True)
         raise HTTPException(500, f"Error processing video: {str(e)}")
 
-@app.on_event("startup")
-async def startup_event():
-    """Clean up temp directory on startup."""
-    shutil.rmtree(TEMP_DIR, ignore_errors=True)
-    os.makedirs(TEMP_DIR, exist_ok=True)
+# Optional: Add a cleanup endpoint to manually remove old jobs
+@app.delete("/screenshots/{job_id}")
+async def cleanup_screenshots(job_id: str):
+    """Delete a job's screenshots directory."""
+    job_dir = os.path.join(TEMP_DIR, job_id)
+    if os.path.exists(job_dir):
+        shutil.rmtree(job_dir)
+        return {"message": f"Cleaned up job {job_id}"}
+    raise HTTPException(404, "Job not found")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
